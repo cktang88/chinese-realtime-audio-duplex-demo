@@ -21,7 +21,33 @@ const noiseSuppressionInput = $("#noise-suppression");
 const autoGainControlInput = $("#auto-gain-control");
 const outputVolumeInput = $("#output-volume");
 const outputVolumeValue = $("#output-volume-value");
-const settingControls = [modelSelect, voiceSelect, replyLanguageInput, instructionsInput, prefixPaddingInput, silenceDurationInput, energyThresholdInput, echoCancellationInput, noiseSuppressionInput, autoGainControlInput, outputVolumeInput];
+const qwenTurnModeInput = $("#qwen-turn-mode");
+const qwenVadThresholdInput = $("#qwen-vad-threshold");
+const qwenSilenceDurationInput = $("#qwen-silence-duration");
+const qwenHistoryTurnsInput = $("#qwen-history-turns");
+const qwenSpeechEmotionInput = $("#qwen-speech-emotion");
+const settingControls = [modelSelect, voiceSelect, replyLanguageInput, instructionsInput, prefixPaddingInput, silenceDurationInput, energyThresholdInput, echoCancellationInput, noiseSuppressionInput, autoGainControlInput, outputVolumeInput, qwenTurnModeInput, qwenVadThresholdInput, qwenSilenceDurationInput, qwenHistoryTurnsInput, qwenSpeechEmotionInput];
+const stepfunVoices = [
+  ["soft-spoken-gentleman", "Soft spoken"], ["magnetic-voiced-male", "Magnetic"], ["vibrant-youth", "Vibrant youth"],
+  ["lively-girl", "Lively"], ["livelybreezy-female", "Breezy"], ["elegantgentle-female", "Elegant"], ["zixinnansheng", "Confident"],
+];
+const qwenVoices = [
+  ["longanqian_v3.1", "Longan Qian v3.1"], ["longanhuan_v3.1", "Longan Huan v3.1"], ["longanlingxin_v3.1", "Longan Lingxin v3.1"],
+  ["longanfengyue_v3.1", "Longan Fengyue v3.1"], ["xunanchuan_v3.1", "Xun Anchuan v3.1"], ["beth_v3.1", "Beth v3.1"],
+  ["betty_v3.1", "Betty v3.1"], ["cally_v3.1", "Cally v3.1"], ["longanqian", "Longan Qian"],
+  ["longanlingxin", "Longan Lingxin"], ["longanlingxi", "Longan Lingxi"], ["longanxiaoxin", "Longan Xiaoxin"], ["longanlufeng", "Longan Lufeng"],
+];
+const stepfunLanguages = [["auto", "Match conversation"], ["English", "English"], ["Mandarin Chinese", "Mandarin Chinese"]];
+const qwenLanguages = [
+  ["auto", "Match conversation"], ["English", "English"], ["Mandarin Chinese", "Mandarin Chinese"], ["French", "French"], ["German", "German"],
+  ["Japanese", "Japanese"], ["Korean", "Korean"], ["Russian", "Russian"], ["Portuguese", "Portuguese"], ["Thai", "Thai"], ["Indonesian", "Indonesian"],
+  ["Vietnamese", "Vietnamese"], ["Spanish", "Spanish"], ["Italian", "Italian"], ["Malay", "Malay"], ["Filipino", "Filipino"], ["Arabic", "Arabic"],
+];
+const providerChoices = {
+  stepfun: { voice: voiceSelect.value || "soft-spoken-gentleman", language: "auto" },
+  qwen: { voice: "longanqian_v3.1", language: "auto" },
+};
+let activeProvider = "stepfun";
 let socket, context, stream, processor, source, silentGain, outputGain;
 let nextPlaybackTime = 0;
 let activeSources = new Set();
@@ -37,9 +63,15 @@ settingsToggle.addEventListener("click", () => {
   settingsPanel.hidden = expanded;
 });
 button.addEventListener("click", () => sessionRequested ? stopConversation() : startConversation());
-for (const input of [modelSelect, voiceSelect, replyLanguageInput, echoCancellationInput, noiseSuppressionInput, autoGainControlInput]) {
+modelSelect.addEventListener("change", () => {
+  updateProviderOptions();
+  restartConversationForSettings();
+});
+for (const input of [voiceSelect, replyLanguageInput, echoCancellationInput, noiseSuppressionInput, autoGainControlInput, qwenTurnModeInput, qwenSpeechEmotionInput]) {
   input.addEventListener("change", restartConversationForSettings);
 }
+voiceSelect.addEventListener("change", () => { providerChoices[activeProvider].voice = voiceSelect.value; });
+replyLanguageInput.addEventListener("change", () => { providerChoices[activeProvider].language = replyLanguageInput.value; });
 instructionsInput.addEventListener("input", noteSettingsEditing);
 instructionsInput.addEventListener("change", restartConversationForSettings);
 outputVolumeInput.addEventListener("input", applyPlaybackVolume);
@@ -47,7 +79,12 @@ for (const input of [prefixPaddingInput, silenceDurationInput, energyThresholdIn
   input.addEventListener("input", noteSettingsEditing);
   input.addEventListener("change", restartConversationForSettings);
 }
+for (const input of [qwenVadThresholdInput, qwenSilenceDurationInput, qwenHistoryTurnsInput]) {
+  input.addEventListener("input", noteSettingsEditing);
+  input.addEventListener("change", restartConversationForSettings);
+}
 outputVolumeInput.addEventListener("change", restartConversationForSettings);
+updateProviderOptions(false);
 
 async function startConversation() {
   const generation = ++sessionGeneration;
@@ -149,7 +186,7 @@ function handleServerMessage(message) {
       currentAssistantMessage = undefined;
       updateStatus("Listening · you can interrupt anytime", "active", "I’m listening", "Keep talking, even while I reply", "listening");
       break;
-    case "error": showError(event.error?.message ?? "StepFun returned an error."); break;
+    case "error": showError(event.error?.message ?? "The provider returned an error."); break;
   }
 }
 
@@ -172,9 +209,10 @@ function startMicrophoneStream() {
 }
 
 function resampleAndEncode(input, inputRate) {
-  const outputLength = Math.floor(input.length * RATE / inputRate);
+  const outputRate = isQwenModel() ? 16000 : RATE;
+  const outputLength = Math.floor(input.length * outputRate / inputRate);
   const pcm = new Int16Array(outputLength);
-  const ratio = inputRate / RATE;
+  const ratio = inputRate / outputRate;
   for (let i = 0; i < outputLength; i += 1) {
     const position = i * ratio;
     const left = Math.floor(position);
@@ -216,13 +254,29 @@ function stopScheduledPlayback() {
 function getSessionSettings() {
   const turnDetection = getTurnDetection();
   if (!turnDetection) return null;
-  return {
+  const session = {
     modalities: ["text", "audio"],
     instructions: getInstructions(),
     voice: voiceSelect.value,
+    turn_detection: turnDetection,
+  };
+  if (isQwenModel()) {
+    const historyTurns = readBoundedInteger(qwenHistoryTurnsInput, 1, 50);
+    if (historyTurns === null) return null;
+    const outputLanguage = languageCode(replyLanguageInput.value);
+    return {
+      ...session,
+      input_audio_format: "pcm",
+      output_audio_format: "pcm",
+      enable_speech_emotion: qwenSpeechEmotionInput.checked,
+      max_history_turns: historyTurns,
+      ...(outputLanguage ? { output_audio: { language: outputLanguage } } : {}),
+    };
+  }
+  return {
+    ...session,
     input_audio_format: "pcm16",
     output_audio_format: "pcm16",
-    turn_detection: turnDetection,
   };
 }
 function getInstructions() {
@@ -239,6 +293,38 @@ function applyPlaybackVolume() {
 function setSettingsDisabled(disabled) {
   for (const input of settingControls) input.disabled = disabled;
 }
+function isQwenModel() { return modelSelect.value === "qwen-audio-3.1-realtime-plus"; }
+function updateProviderOptions(saveCurrent = true) {
+  if (saveCurrent) {
+    providerChoices[activeProvider].voice = voiceSelect.value;
+    providerChoices[activeProvider].language = replyLanguageInput.value;
+  }
+  const provider = isQwenModel() ? "qwen" : "stepfun";
+  const voices = provider === "qwen" ? qwenVoices : stepfunVoices;
+  const languages = provider === "qwen" ? qwenLanguages : stepfunLanguages;
+  voiceSelect.replaceChildren(...voices.map(([value, label]) => new Option(label, value)));
+  replyLanguageInput.replaceChildren(...languages.map(([value, label]) => new Option(label, value)));
+  voiceSelect.value = providerChoices[provider].voice;
+  if (!voiceSelect.value) voiceSelect.value = voices[0][0];
+  replyLanguageInput.value = providerChoices[provider].language;
+  if (!replyLanguageInput.value) replyLanguageInput.value = "auto";
+  $("#stepfun-audio-options").hidden = provider !== "stepfun";
+  $("#qwen-audio-options").hidden = provider !== "qwen";
+  $("#model-note").textContent = provider === "qwen"
+    ? "Model access and the WebSocket endpoint depend on your DashScope region. See the README for setup."
+    : "Model access depends on your StepFun account. Choose before starting a session.";
+  $("#language-note").textContent = provider === "qwen"
+    ? "Qwen supports these reply languages; matching conversation leaves the choice to the model."
+    : "StepFun Realtime supports Chinese and English. “Match conversation” follows the language you use.";
+  $("#audio-format").textContent = provider === "qwen" ? "PCM16 · 16 KHZ IN · 24 KHZ OUT" : "PCM16 · 24 KHZ";
+  $("#docs-link").href = provider === "qwen"
+    ? "https://help.aliyun.com/en/model-studio/qwen-audio-realtime-user-guides"
+    : "https://platform.stepfun.ai/docs/en/api-reference/realtime/chat";
+  activeProvider = provider;
+}
+function languageCode(language) {
+  return ({ English: "en", "Mandarin Chinese": "zh", French: "fr", German: "de", Japanese: "ja", Korean: "ko", Russian: "ru", Portuguese: "pt", Thai: "th", Indonesian: "id", Vietnamese: "vi", Spanish: "es", Italian: "it", Malay: "ms", Filipino: "fil", Arabic: "ar" })[language];
+}
 function clearConversation() {
   conversation.replaceChildren();
   currentAssistantMessage = undefined;
@@ -253,7 +339,10 @@ function noteSettingsEditing() {
 }
 function restartConversationForSettings() {
   if (!getTurnDetection()) {
-    [prefixPaddingInput, silenceDurationInput, energyThresholdInput].find((input) => !input.checkValidity())?.reportValidity();
+    const inputs = isQwenModel()
+      ? [qwenVadThresholdInput, qwenSilenceDurationInput, qwenHistoryTurnsInput]
+      : [prefixPaddingInput, silenceDurationInput, energyThresholdInput];
+    inputs.find((input) => !input.checkValidity())?.reportValidity();
     updateStatus("Settings need attention", "", "Check the highlighted value", "The current audio session is still running", "");
     return;
   }
@@ -266,11 +355,24 @@ function restartConversationForSettings() {
   ++sessionGeneration;
   socket = undefined;
   cleanupAudio();
-  if (previousSocket?.readyState === WebSocket.OPEN) previousSocket.close(1000, "Settings changed");
+  if (previousSocket?.readyState === WebSocket.OPEN || previousSocket?.readyState === WebSocket.CONNECTING) previousSocket.close(1000, "Settings changed");
   updateStatus("Restarting…", "busy", "Applying your settings", "Starting a fresh conversation", "");
   startConversation();
 }
 function getTurnDetection() {
+  if (isQwenModel()) {
+    if (readBoundedInteger(qwenHistoryTurnsInput, 1, 50) === null) return null;
+    if (qwenTurnModeInput.value === "smart_turn") return { type: "smart_turn" };
+    const threshold = qwenVadThresholdInput.valueAsNumber;
+    if (!Number.isFinite(threshold) || threshold < -1 || threshold > 1) {
+      qwenVadThresholdInput.setCustomValidity("Enter a value from -1.0 to 1.0.");
+      return null;
+    }
+    qwenVadThresholdInput.setCustomValidity("");
+    const silence = readBoundedInteger(qwenSilenceDurationInput, 200, 6000);
+    if (silence === null) return null;
+    return { type: "server_vad", threshold, silence_duration_ms: silence };
+  }
   const prefixPadding = readNonnegativeInteger(prefixPaddingInput);
   const silenceDuration = readNonnegativeInteger(silenceDurationInput);
   const energyThreshold = readNonnegativeInteger(energyThresholdInput, 5000);
@@ -291,12 +393,24 @@ function readNonnegativeInteger(input, maximum = Infinity) {
   input.setCustomValidity("");
   return value;
 }
+function readBoundedInteger(input, minimum, maximum) {
+  const value = input.valueAsNumber;
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    input.setCustomValidity(`Enter a whole number from ${minimum} to ${maximum}.`);
+    return null;
+  }
+  input.setCustomValidity("");
+  return value;
+}
 function showAdvancedSettingsError() {
   settingsPanel.hidden = false;
   settingsToggle.setAttribute("aria-expanded", "true");
   const advanced = document.querySelector(".advanced-settings");
   advanced.open = true;
-  [prefixPaddingInput, silenceDurationInput, energyThresholdInput].find((input) => !input.checkValidity())?.reportValidity();
+  const advancedInputs = isQwenModel()
+    ? [qwenVadThresholdInput, qwenSilenceDurationInput, qwenHistoryTurnsInput]
+    : [prefixPaddingInput, silenceDurationInput, energyThresholdInput];
+  advancedInputs.find((input) => !input.checkValidity())?.reportValidity();
   showError("Check the advanced audio values, then start again.");
 }
 function appendAssistantText(text) {
@@ -317,7 +431,7 @@ function createMessage(role) {
   message.className = `message ${role}`;
   const label = document.createElement("div");
   label.className = "message-label";
-  label.textContent = role === "user" ? "You" : "StepAudio";
+  label.textContent = role === "user" ? "You" : "Assistant";
   const text = document.createElement("div");
   text.className = "message-text";
   message.append(label, text);
@@ -356,7 +470,7 @@ function stopConversation() {
   stoppedByUser = true;
   const previousSocket = socket;
   socket = undefined;
-  if (previousSocket?.readyState === WebSocket.OPEN) previousSocket.close(1000, "Conversation ended");
+  if (previousSocket?.readyState === WebSocket.OPEN || previousSocket?.readyState === WebSocket.CONNECTING) previousSocket.close(1000, "Conversation ended");
   cleanupAudio();
   updateStatus("Ready when you are", "", "Your voice is the interface", "Start a session and say hello", "");
 }

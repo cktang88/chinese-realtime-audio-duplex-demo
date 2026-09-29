@@ -3,11 +3,14 @@ import { createServer } from "node:http";
 import { extname, join, normalize } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 
-const apiKey = process.env.STEPFUN_API_KEY;
+const providers = {
+  "stepaudio-3-realtime-preview": { name: "StepFun", key: process.env.STEPFUN_API_KEY, endpoint: "wss://api.stepfun.ai/v1/realtime" },
+  "stepaudio-2.5-realtime": { name: "StepFun", key: process.env.STEPFUN_API_KEY, endpoint: "wss://api.stepfun.ai/v1/realtime" },
+  "qwen-audio-3.1-realtime-plus": { name: "Qwen", key: process.env.DASHSCOPE_API_KEY, endpoint: process.env.QWEN_REALTIME_URL ?? "wss://maas.qwencloudapi.com/api-ws/v1/realtime" },
+};
 const defaultModel = "stepaudio-3-realtime-preview";
-const allowedModels = new Set([defaultModel, "stepaudio-2.5-realtime"]);
-if (!apiKey) {
-  console.error("STEPFUN_API_KEY is missing. Add it to .env and restart the server.");
+if (!process.env.STEPFUN_API_KEY && !process.env.DASHSCOPE_API_KEY) {
+  console.error("Add STEPFUN_API_KEY or DASHSCOPE_API_KEY to .env, then restart the server.");
   process.exit(1);
 }
 
@@ -35,16 +38,36 @@ server.on("upgrade", (request, socket, head) => {
   }
   const url = new URL(request.url ?? "/", `http://${host}`);
   const model = url.searchParams.get("model") ?? defaultModel;
-  if (url.pathname !== "/realtime" || !allowedModels.has(model)) {
+  const provider = Object.hasOwn(providers, model) ? providers[model] : undefined;
+  if (url.pathname !== "/realtime" || !provider) {
     socket.destroy();
     return;
   }
-  clients.handleUpgrade(request, socket, head, (client) => clients.emit("connection", client, model));
+  clients.handleUpgrade(request, socket, head, (client) => clients.emit("connection", client, model, provider));
 });
 
-clients.on("connection", (client, model) => {
-  const upstream = new WebSocket(`wss://api.stepfun.ai/v1/realtime?model=${encodeURIComponent(model)}`, {
-    headers: { Authorization: `Bearer ${apiKey}` },
+clients.on("connection", (client, model, provider) => {
+  if (!provider.key) {
+    client.send(JSON.stringify({ type: "proxy.error", message: `${provider.name} API key is missing. Add its key to .env and restart the server.` }));
+    client.close(1011, "API key missing");
+    return;
+  }
+  let upstreamUrl;
+  try {
+    upstreamUrl = new URL(provider.endpoint);
+  } catch {
+    client.send(JSON.stringify({ type: "proxy.error", message: `${provider.name} realtime WebSocket URL is invalid. Check the URL in .env and restart the server.` }));
+    client.close(1011, "Realtime endpoint invalid");
+    return;
+  }
+  if (upstreamUrl.protocol !== "wss:") {
+    client.send(JSON.stringify({ type: "proxy.error", message: `${provider.name} realtime endpoint must use wss://.` }));
+    client.close(1011, "Realtime endpoint must use wss");
+    return;
+  }
+  upstreamUrl.searchParams.set("model", model);
+  const upstream = new WebSocket(upstreamUrl, {
+    headers: { Authorization: `Bearer ${provider.key}` },
   });
   const relay = (from, to) => from.on("message", (message, isBinary) => {
     if (to.readyState === WebSocket.OPEN) to.send(message, { binary: isBinary });
@@ -53,12 +76,12 @@ clients.on("connection", (client, model) => {
   relay(upstream, client);
   upstream.on("unexpected-response", (_request, response) => {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify({ type: "proxy.error", message: `StepFun rejected the connection (${response.statusCode ?? "unknown"}). Check the API key and model access.` }));
+      client.send(JSON.stringify({ type: "proxy.error", message: `${provider.name} rejected the connection (${response.statusCode ?? "unknown"}). Check the API key, region, and model access.` }));
     }
     client.close(1011, "Upstream connection rejected");
   });
   upstream.on("error", () => {
-    if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "proxy.error", message: "Could not connect to StepFun. Check your network and try again." }));
+    if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "proxy.error", message: `Could not connect to ${provider.name}. Check the realtime endpoint and network.` }));
     client.close(1011, "Upstream connection failed");
   });
   client.on("close", () => {
@@ -78,5 +101,5 @@ server.on("error", (error) => {
   console.error(`Could not start the demo server (${error.code ?? "unknown error"}).`);
   process.exitCode = 1;
 });
-server.on("listening", () => console.log(`StepFun audio demo ready at http://localhost:${server.address().port}`));
+server.on("listening", () => console.log(`Realtime audio demo ready at http://localhost:${server.address().port}`));
 server.listen(port, "127.0.0.1");
