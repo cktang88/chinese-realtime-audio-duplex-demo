@@ -281,6 +281,15 @@ function getSessionSettings() {
 }
 function getInstructions() {
   const style = instructionsInput.value.trim();
+  if (!isQwenModel()) {
+    const language = replyLanguageInput.value;
+    const languageInstruction = language === "Mandarin Chinese"
+      ? "Reply in natural, fluent spoken Mandarin Chinese by default. Use Chinese characters for Chinese speech, with native Mandarin pronunciation and lexical tones. Do not translate Chinese into English or romanize it into pinyin unless explicitly asked."
+      : language === "English"
+        ? "Reply in English by default. If the user asks for another language, follow that request."
+        : "Reply in the same language the user is speaking. When the user speaks Mandarin Chinese, respond in fluent spoken Mandarin using Chinese characters and natural native pronunciation and tones. Do not translate Chinese into English or romanize it into pinyin unless explicitly asked.";
+    return `${languageInstruction}\n\n${style}`;
+  }
   const language = replyLanguageInput.value;
   if (language === "auto") return style;
   return `Respond in ${language} by default. If the user asks for another language, follow that request.\n\n${style}`;
